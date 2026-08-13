@@ -1,0 +1,2 @@
+# Force LF endings so the shebang never breaks on Linux
+*.sh text eol=lf
