@@ -55,38 +55,127 @@ fi
 
 setup() {
   log "Installing OS packages (sudo may prompt)..."
-  local SUDO=""
-  [[ "$(id -u)" -ne 0 ]] && SUDO="sudo"
 
-  $SUDO apt-get update
-  $SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    git python3 python3-venv python3-pip \
+  # Do NOT write `$SUDO VAR=value cmd`. Bash decides what counts as an
+  # assignment prefix at parse time, so when $SUDO is empty (running as root)
+  # the VAR=value word lands in command position and bash tries to exec it.
+  # Export instead.
+  export DEBIAN_FRONTEND=noninteractive
+
+  local SUDO=()
+  if [[ "$(id -u)" -ne 0 ]]; then
+    command -v sudo >/dev/null 2>&1 || die "Not root and sudo not available."
+    SUDO=(sudo -E)
+  fi
+
+  # Version-matched venv package. Ubuntu splits it out per minor version
+  # (python3.8-venv on 20.04, python3.10-venv on 22.04, ...).
+  local PYVER VENVPKG
+  PYVER="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo "")"
+  VENVPKG="python3-venv"
+  [[ -n "$PYVER" ]] && VENVPKG="python3-venv python${PYVER}-venv"
+
+  "${SUDO[@]}" apt-get update || warn "apt-get update had errors; continuing."
+
+  # shellcheck disable=SC2086
+  "${SUDO[@]}" apt-get install -y \
+    git python3 python3-pip python3-dev $VENVPKG \
+    build-essential libssl-dev \
     binutils file p7zip-full unzip yara libimage-exiftool-perl coreutils \
     || warn "Some packages failed to install; continuing."
 
+  # git is not optional: the Didier Stevens Suite clone depends on it, and
+  # that is where every PDF stage lives.
+  if ! command -v git >/dev/null 2>&1; then
+    warn "git still missing after apt. Retrying just git..."
+    "${SUDO[@]}" apt-get install -y git || true
+    command -v git >/dev/null 2>&1 \
+      || warn "git unavailable. PDF, RTF and oledump stages will be skipped."
+  fi
+
   log "Setting up Python venv at $VENV ..."
   mkdir -p "$TOOLS"
-  [[ -d "$VENV" ]] || python3 -m venv "$VENV"
+
+  if [[ ! -f "$VENV/bin/activate" ]]; then
+    rm -rf "$VENV"
+    if ! python3 -m venv "$VENV" 2>"$TOOLS/venv_error.log"; then
+      warn "venv creation failed. Retrying after installing $VENVPKG ..."
+      # shellcheck disable=SC2086
+      "${SUDO[@]}" apt-get install -y $VENVPKG || true
+      rm -rf "$VENV"
+      python3 -m venv "$VENV" 2>>"$TOOLS/venv_error.log" || {
+        warn "venv still failing. Details: $TOOLS/venv_error.log"
+        warn "Falling back to venv without pip, then bootstrapping."
+        rm -rf "$VENV"
+        python3 -m venv --without-pip "$VENV" || die "Cannot create a venv. Install $VENVPKG manually."
+      }
+    fi
+  fi
+
+  [[ -f "$VENV/bin/activate" ]] || die "No activate script at $VENV. Setup cannot continue."
   # shellcheck disable=SC1091
   source "$VENV/bin/activate"
-  python -m pip install --upgrade pip setuptools wheel
 
-  log "Installing maldoc tools..."
-  python -m pip install -U oletools olefile msoffcrypto-tool yara-python \
-    || warn "oletools install had errors; check $VENV"
+  # --without-pip fallback leaves no pip; bootstrap it.
+  if ! python -m pip --version >/dev/null 2>&1; then
+    log "Bootstrapping pip into the venv..."
+    python -m ensurepip --upgrade 2>/dev/null || {
+      curl -fsSL https://bootstrap.pypa.io/get-pip.py -o "$TOOLS/get-pip.py" \
+        && python "$TOOLS/get-pip.py"
+    } || die "Could not bootstrap pip. Install $VENVPKG and re-run --setup-only."
+  fi
 
-  python -m pip install -U "git+https://github.com/DissectMalware/XLMMacroDeobfuscator.git" \
-    || warn "XLMMacroDeobfuscator install failed (optional)."
+  python -m pip install --upgrade pip setuptools wheel || warn "pip self-upgrade failed; continuing."
+
+  # Install these SEPARATELY. pip aborts the whole transaction on any single
+  # build failure, so bundling them means one broken C extension silently
+  # takes out oletools - the package that answers most of these cases.
+  log "Installing oletools (core)..."
+  python -m pip install -U oletools || warn "oletools install FAILED - most stages will be skipped."
+  python -m pip install -U olefile          || warn "olefile install failed."
+  python -m pip install -U msoffcrypto-tool || warn "msoffcrypto-tool install failed (encrypted docs unsupported)."
+
+  # Optional. The script uses the yara CLI binary, not this module, so a
+  # failed compile here costs nothing. Prefer a prebuilt wheel over building.
+  log "Installing yara-python (optional)..."
+  python -m pip install -U --only-binary :all: yara-python 2>/dev/null \
+    || python -m pip install -U yara-python 2>/dev/null \
+    || warn "yara-python unavailable (optional - the yara CLI is what this script uses)."
+
+  if command -v git >/dev/null 2>&1; then
+    python -m pip install -U "git+https://github.com/DissectMalware/XLMMacroDeobfuscator.git" \
+      || warn "XLMMacroDeobfuscator install failed (optional)."
+  else
+    warn "Skipping XLMMacroDeobfuscator: git not available."
+  fi
 
   log "Pulling Didier Stevens Suite..."
-  if [[ -d "$DSS/.git" ]]; then
+  if ! command -v git >/dev/null 2>&1; then
+    warn "git not available - cannot fetch Didier Stevens Suite."
+    warn "Install it and re-run: apt-get install -y git && $0 --setup-only"
+  elif [[ -d "$DSS/.git" ]]; then
     git -C "$DSS" pull --ff-only || warn "DSS update failed; using existing copy."
   else
     git clone --depth 1 https://github.com/DidierStevens/DidierStevensSuite.git "$DSS" \
       || warn "DSS clone failed; PDF and oledump stages will be skipped."
   fi
 
-  log "Setup complete."
+  # Report what actually made it, rather than claiming success blindly.
+  log "Verifying toolchain..."
+  local missing=() t
+  for t in oleid olevba mraptor msodde rtfobj yara exiftool 7z; do
+    command -v "$t" >/dev/null 2>&1 || missing+=("$t")
+  done
+  [[ -f "$DSS/pdfid.py" ]]      || missing+=("pdfid.py")
+  [[ -f "$DSS/pdf-parser.py" ]] || missing+=("pdf-parser.py")
+  [[ -f "$DSS/oledump.py" ]]    || missing+=("oledump.py")
+
+  if [[ ${#missing[@]} -eq 0 ]]; then
+    log "Setup complete. All expected tools present."
+  else
+    warn "Setup finished with missing tools: ${missing[*]}"
+    warn "Those stages will be skipped. Re-run --setup-only after fixing."
+  fi
 }
 
 if [[ "$DO_INSTALL" -eq 1 ]]; then
